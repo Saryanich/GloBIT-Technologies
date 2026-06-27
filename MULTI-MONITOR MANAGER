@@ -1,0 +1,773 @@
+# ==================== MULTI-MONITOR MANAGER ====================
+import os
+import sys
+import json
+import threading
+import subprocess
+import platform
+import logging
+from datetime import datetime
+from typing import List, Dict, Optional, Any, Union
+
+# Third-party imports
+try:
+    from screeninfo import get_monitors
+    SCREENINFO_AVAILABLE = True
+except ImportError:
+    SCREENINFO_AVAILABLE = False
+
+try:
+    from PyQt6.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton
+    from PyQt6.QtCore import Qt, QTimer
+    from PyQt6.QtGui import QFont, QPalette, QColor, QScreen, QGuiApplication
+    PYQT_AVAILABLE = True
+except ImportError:
+    PYQT_AVAILABLE = False
+
+try:
+    if platform.system() == "Windows":
+        import ctypes
+        from ctypes import wintypes
+        WIN32_AVAILABLE = True
+    else:
+        WIN32_AVAILABLE = False
+except ImportError:
+    WIN32_AVAILABLE = False
+
+# Configure logging
+logger = logging.getLogger(__name__)
+
+
+class MonitorInfo:
+    """Data class for monitor information"""
+    
+    def __init__(self, index: int, name: str, width: int, height: int, 
+                 x: int, y: int, is_primary: bool = False,
+                 work_width: Optional[int] = None, 
+                 work_height: Optional[int] = None,
+                 work_x: Optional[int] = None,
+                 work_y: Optional[int] = None):
+        self.index = index
+        self.name = name
+        self.width = width
+        self.height = height
+        self.x = x
+        self.y = y
+        self.is_primary = is_primary
+        self.work_width = work_width or width
+        self.work_height = work_height or height
+        self.work_x = work_x or x
+        self.work_y = work_y or y
+    
+    def to_dict(self) -> Dict:
+        """Convert to dictionary"""
+        return {
+            'index': self.index,
+            'name': self.name,
+            'width': self.width,
+            'height': self.height,
+            'x': self.x,
+            'y': self.y,
+            'is_primary': self.is_primary,
+            'work_width': self.work_width,
+            'work_height': self.work_height,
+            'work_x': self.work_x,
+            'work_y': self.work_y
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'MonitorInfo':
+        """Create from dictionary"""
+        return cls(
+            index=data['index'],
+            name=data['name'],
+            width=data['width'],
+            height=data['height'],
+            x=data['x'],
+            y=data['y'],
+            is_primary=data.get('is_primary', False),
+            work_width=data.get('work_width'),
+            work_height=data.get('work_height'),
+            work_x=data.get('work_x'),
+            work_y=data.get('work_y')
+        )
+    
+    def __repr__(self) -> str:
+        return f"MonitorInfo({self.index}: {self.name} {self.width}x{self.height} at ({self.x}, {self.y}))"
+
+
+class MultiMonitorManager:
+    """
+    Universal multi-monitor manager with accurate position detection
+    
+    Features:
+    - Cross-platform (Windows, Linux, macOS)
+    - Multi-level detection (Win32 API → PyQt6 → screeninfo → Tkinter)
+    - Auto-save configuration
+    - Launch applications on specific monitors
+    - Singleton pattern for global access
+    """
+    
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __new__(cls, *args, **kwargs):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
+    
+    def __init__(self, config_dir: Optional[str] = None):
+        """
+        Initialize the multi-monitor manager
+        
+        Args:
+            config_dir: Custom configuration directory (optional)
+        """
+        if hasattr(self, '_initialized') and self._initialized:
+            return
+        
+        self._initialized = True
+        self.monitors: List[MonitorInfo] = []
+        self.processes: Dict[int, subprocess.Popen] = {}
+        self.is_running = True
+        
+        self._init_paths(config_dir)
+        self._detect_monitors_accurate()
+        
+        logger.info(f"Initialized. Found {len(self.monitors)} monitor(s)")
+        for i, mon in enumerate(self.monitors):
+            logger.info(f"  {i+1}. {mon.name} ({mon.width}x{mon.height}) at ({mon.x}, {mon.y})")
+    
+    def _init_paths(self, config_dir: Optional[str] = None):
+        """Initialize file paths"""
+        try:
+            if config_dir:
+                base_path = config_dir
+            else:
+                base_path = os.path.dirname(os.path.abspath(__file__))
+            
+            self.config_path = os.path.join(base_path, "config")
+            self.temp_dir = os.path.join(base_path, "temp")
+            
+            os.makedirs(self.config_path, exist_ok=True)
+            os.makedirs(self.temp_dir, exist_ok=True)
+            
+            self.monitor_config_path = os.path.join(self.config_path, "monitors.json")
+        except Exception as e:
+            logger.error(f"Failed to initialize paths: {e}")
+            # Fallback to current directory
+            self.config_path = os.path.join(os.getcwd(), "config")
+            self.temp_dir = os.path.join(os.getcwd(), "temp")
+            self.monitor_config_path = os.path.join(self.config_path, "monitors.json")
+            os.makedirs(self.config_path, exist_ok=True)
+            os.makedirs(self.temp_dir, exist_ok=True)
+    
+    def _detect_monitors_accurate(self):
+        """Detect monitors using multiple methods"""
+        self.monitors = []
+        
+        # Method 1: Win32 API (Windows only)
+        if WIN32_AVAILABLE:
+            try:
+                monitors = self._get_monitors_win32()
+                if monitors:
+                    self.monitors = monitors
+                    logger.info(f"Detected via Win32 API: {len(monitors)} monitor(s)")
+                    self._save_monitor_config()
+                    return
+            except Exception as e:
+                logger.warning(f"Win32 API detection failed: {e}")
+        
+        # Method 2: PyQt6
+        if PYQT_AVAILABLE and not self.monitors:
+            try:
+                monitors = self._get_monitors_pyqt()
+                if monitors:
+                    self.monitors = monitors
+                    logger.info(f"Detected via PyQt6: {len(monitors)} monitor(s)")
+                    self._save_monitor_config()
+                    return
+            except Exception as e:
+                logger.warning(f"PyQt6 detection failed: {e}")
+        
+        # Method 3: screeninfo
+        if SCREENINFO_AVAILABLE and not self.monitors:
+            try:
+                for i, m in enumerate(get_monitors()):
+                    self.monitors.append(MonitorInfo(
+                        index=i,
+                        name=m.name or f"Monitor {i+1}",
+                        width=m.width,
+                        height=m.height,
+                        x=m.x,
+                        y=m.y,
+                        is_primary=m.is_primary
+                    ))
+                logger.info(f"Detected via screeninfo: {len(self.monitors)} monitor(s)")
+                self._save_monitor_config()
+                return
+            except Exception as e:
+                logger.warning(f"screeninfo detection failed: {e}")
+        
+        # Method 4: Tkinter (fallback)
+        if not self.monitors:
+            try:
+                import tkinter as tk
+                root = tk.Tk()
+                root.withdraw()
+                
+                self.monitors.append(MonitorInfo(
+                    index=0,
+                    name="Primary Monitor",
+                    width=root.winfo_screenwidth(),
+                    height=root.winfo_screenheight(),
+                    x=0,
+                    y=0,
+                    is_primary=True
+                ))
+                
+                # Add secondary monitor if dual-screen setup
+                screen_width = root.winfo_screenwidth()
+                self.monitors.append(MonitorInfo(
+                    index=1,
+                    name="Secondary Monitor",
+                    width=1920,
+                    height=1080,
+                    x=screen_width,
+                    y=0,
+                    is_primary=False
+                ))
+                
+                root.destroy()
+                logger.info(f"Detected via Tkinter (fallback): {len(self.monitors)} monitor(s)")
+            except Exception as e:
+                logger.warning(f"Tkinter detection failed: {e}")
+        
+        # Method 5: Default fallback
+        if not self.monitors:
+            self.monitors = [
+                MonitorInfo(0, "Monitor 1", 1920, 1080, 0, 0, True),
+                MonitorInfo(1, "Monitor 2", 1920, 1080, 1920, 0, False)
+            ]
+            logger.warning(f"Using fallback configuration: {len(self.monitors)} monitor(s)")
+        
+        self._save_monitor_config()
+    
+    def _get_monitors_win32(self) -> List[MonitorInfo]:
+        """Get monitors using Windows API"""
+        monitors = []
+        try:
+            user32 = ctypes.windll.user32
+            
+            MONITORENUMPROC = ctypes.WINFUNCTYPE(
+                ctypes.c_int,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.POINTER(wintypes.RECT),
+                ctypes.c_double
+            )
+            
+            monitors_list = []
+            
+            def callback(hMonitor, hdcMonitor, lprcMonitor, dwData):
+                class MONITORINFOEXW(ctypes.Structure):
+                    _fields_ = [
+                        ("cbSize", wintypes.DWORD),
+                        ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT),
+                        ("dwFlags", wintypes.DWORD),
+                        ("szDevice", wintypes.WCHAR * 32)
+                    ]
+                
+                monitor_info = MONITORINFOEXW()
+                monitor_info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+                
+                if user32.GetMonitorInfoW(hMonitor, ctypes.byref(monitor_info)):
+                    rc = monitor_info.rcMonitor
+                    rc_work = monitor_info.rcWork
+                    is_primary = bool(monitor_info.dwFlags & 0x00000001)
+                    
+                    monitors_list.append({
+                        'name': monitor_info.szDevice,
+                        'x': rc.left,
+                        'y': rc.top,
+                        'width': rc.right - rc.left,
+                        'height': rc.bottom - rc.top,
+                        'work_x': rc_work.left,
+                        'work_y': rc_work.top,
+                        'work_width': rc_work.right - rc_work.left,
+                        'work_height': rc_work.bottom - rc_work.top,
+                        'is_primary': is_primary
+                    })
+                return 1
+            
+            callback_func = MONITORENUMPROC(callback)
+            hdc = user32.GetDC(0)
+            
+            if user32.EnumDisplayMonitors(hdc, None, callback_func, 0):
+                monitors_list.sort(key=lambda m: m['x'])
+                
+                for i, mon in enumerate(monitors_list):
+                    monitors.append(MonitorInfo(
+                        index=i,
+                        name=mon['name'],
+                        width=mon['width'],
+                        height=mon['height'],
+                        x=mon['x'],
+                        y=mon['y'],
+                        is_primary=mon['is_primary'],
+                        work_width=mon['work_width'],
+                        work_height=mon['work_height'],
+                        work_x=mon['work_x'],
+                        work_y=mon['work_y']
+                    ))
+                
+                user32.ReleaseDC(0, hdc)
+                
+        except Exception as e:
+            logger.error(f"Win32 API error: {e}")
+        
+        return monitors
+    
+    def _get_monitors_pyqt(self) -> List[MonitorInfo]:
+        """Get monitors using PyQt6"""
+        monitors = []
+        try:
+            app = QApplication.instance()
+            if not app:
+                app = QApplication(sys.argv)
+            
+            screens = QGuiApplication.screens()
+            
+            for i, screen in enumerate(screens):
+                geom = screen.geometry()
+                available_geom = screen.availableGeometry()
+                
+                monitors.append(MonitorInfo(
+                    index=i,
+                    name=screen.name(),
+                    width=geom.width(),
+                    height=geom.height(),
+                    x=geom.x(),
+                    y=geom.y(),
+                    is_primary=(screen == QGuiApplication.primaryScreen()),
+                    work_width=available_geom.width(),
+                    work_height=available_geom.height(),
+                    work_x=available_geom.x(),
+                    work_y=available_geom.y()
+                ))
+            
+            if not QApplication.instance():
+                app.quit()
+                
+        except Exception as e:
+            logger.error(f"PyQt6 detection error: {e}")
+        
+        return monitors
+    
+    def _save_monitor_config(self):
+        """Save monitor configuration to file"""
+        try:
+            config = {
+                'monitors': [m.to_dict() for m in self.monitors],
+                'saved_at': datetime.now().isoformat()
+            }
+            with open(self.monitor_config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+            logger.debug(f"Configuration saved to {self.monitor_config_path}")
+        except Exception as e:
+            logger.warning(f"Failed to save configuration: {e}")
+    
+    def load_monitor_config(self) -> bool:
+        """Load monitor configuration from file"""
+        try:
+            if os.path.exists(self.monitor_config_path):
+                with open(self.monitor_config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                
+                self.monitors = [MonitorInfo.from_dict(m) for m in config['monitors']]
+                logger.info(f"Loaded configuration: {len(self.monitors)} monitor(s)")
+                return True
+        except Exception as e:
+            logger.warning(f"Failed to load configuration: {e}")
+        return False
+    
+    def launch_on_monitor(self, monitor_index: int, script_path: str, 
+                         args: Optional[List[str]] = None) -> Optional[subprocess.Popen]:
+        """
+        Launch a script on a specific monitor
+        
+        Args:
+            monitor_index: Index of the target monitor
+            script_path: Path to the script to launch
+            args: Additional arguments for the script
+            
+        Returns:
+            Popen object or None if failed
+        """
+        if monitor_index >= len(self.monitors):
+            logger.error(f"Monitor index {monitor_index} out of range")
+            return None
+        
+        if monitor_index in self.processes:
+            try:
+                self.processes[monitor_index].kill()
+            except:
+                pass
+            del self.processes[monitor_index]
+        
+        monitor = self.monitors[monitor_index]
+        
+        # Generate environment variables for the target monitor
+        env = os.environ.copy()
+        env['MONITOR_INDEX'] = str(monitor_index)
+        env['MONITOR_X'] = str(monitor.x)
+        env['MONITOR_Y'] = str(monitor.y)
+        env['MONITOR_WIDTH'] = str(monitor.width)
+        env['MONITOR_HEIGHT'] = str(monitor.height)
+        
+        cmd = [sys.executable, script_path]
+        if args:
+            cmd.extend(args)
+        
+        try:
+            process = subprocess.Popen(
+                cmd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" and hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            )
+            
+            self.processes[monitor_index] = process
+            logger.info(f"Launched process on monitor {monitor_index} (PID: {process.pid})")
+            return process
+            
+        except Exception as e:
+            logger.error(f"Failed to launch process: {e}")
+            return None
+    
+    def launch_display_window(self, monitor_index: int) -> bool:
+        """
+        Launch a simple display window on a specific monitor
+        
+        Args:
+            monitor_index: Index of the target monitor
+            
+        Returns:
+            bool: True if successful
+        """
+        if monitor_index >= len(self.monitors):
+            logger.error(f"Monitor index {monitor_index} out of range")
+            return False
+        
+        if PYQT_AVAILABLE:
+            return self._launch_pyqt_window(monitor_index)
+        else:
+            return self._launch_tkinter_window(monitor_index)
+    
+    def _launch_pyqt_window(self, monitor_index: int) -> bool:
+        """Launch PyQt6 display window"""
+        script_code = self._generate_pyqt_script(monitor_index)
+        script_path = os.path.join(self.temp_dir, f"monitor_{monitor_index}.py")
+        
+        with open(script_path, 'w', encoding='utf-8') as f:
+            f.write(script_code)
+        
+        return self.launch_on_monitor(monitor_index, script_path) is not None
+    
+    def _launch_tkinter_window(self, monitor_index: int) -> bool:
+        """Launch Tkinter display window"""
+        script_code = self._generate_tkinter_script(monitor_index)
+        script_path = os.path.join(self.temp_dir, f"monitor_tk_{monitor_index}.py")
+        
+        with open(script_path, 'w', encoding='utf-8') as f:
+            f.write(script_code)
+        
+        return self.launch_on_monitor(monitor_index, script_path) is not None
+    
+    def _generate_pyqt_script(self, monitor_index: int) -> str:
+        """Generate PyQt6 display script"""
+        return f'''# -*- coding: utf-8 -*-
+import sys, os, json
+from datetime import datetime
+
+try:
+    from PyQt6.QtWidgets import QApplication, QMainWindow, QLabel, QVBoxLayout, QWidget, QPushButton
+    from PyQt6.QtCore import Qt, QTimer
+    from PyQt6.QtGui import QFont, QPalette, QColor
+except ImportError:
+    print("PyQt6 not installed")
+    sys.exit(1)
+
+# Get monitor info from environment
+MONITOR_INDEX = int(os.environ.get('MONITOR_INDEX', {monitor_index}))
+MONITOR_X = int(os.environ.get('MONITOR_X', 0))
+MONITOR_Y = int(os.environ.get('MONITOR_Y', 0))
+MONITOR_W = int(os.environ.get('MONITOR_WIDTH', 1920))
+MONITOR_H = int(os.environ.get('MONITOR_HEIGHT', 1080))
+
+class DisplayWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        
+        self.setWindowTitle(f"Monitor {{MONITOR_INDEX}}")
+        self.setGeometry(MONITOR_X, MONITOR_Y, MONITOR_W, MONITOR_H)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setStyleSheet("background-color: #0a0a2a;")
+        
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Monitor info
+        title = QLabel(f"🖥️ Monitor {{MONITOR_INDEX}}")
+        title.setFont(QFont("Arial", 48, QFont.Weight.Bold))
+        title.setStyleSheet("color: #00FF00;")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        
+        res_label = QLabel(f"{{MONITOR_W}} × {{MONITOR_H}}")
+        res_label.setFont(QFont("Arial", 24))
+        res_label.setStyleSheet("color: #FFD700;")
+        res_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(res_label)
+        
+        layout.addSpacing(30)
+        
+        # Time display
+        self.time_label = QLabel()
+        self.time_label.setFont(QFont("Arial", 60, QFont.Weight.Bold))
+        self.time_label.setStyleSheet("color: #00BFFF;")
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.time_label)
+        
+        self.date_label = QLabel()
+        self.date_label.setFont(QFont("Arial", 18))
+        self.date_label.setStyleSheet("color: #95A5A6;")
+        self.date_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.date_label)
+        
+        layout.addSpacing(50)
+        
+        # Exit button
+        exit_btn = QPushButton("✕ CLOSE (Esc)")
+        exit_btn.setFont(QFont("Arial", 14))
+        exit_btn.setStyleSheet("""
+            QPushButton {{
+                background-color: rgba(231, 76, 60, 0.5);
+                color: white;
+                border: 2px solid #E74C3C;
+                border-radius: 10px;
+                padding: 10px 30px;
+                font-weight: bold;
+            }}
+            QPushButton:hover {{
+                background-color: rgba(231, 76, 60, 0.8);
+            }}
+        """)
+        exit_btn.clicked.connect(self.close)
+        layout.addWidget(exit_btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        
+        # Timer for clock updates
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_time)
+        self.timer.start(1000)
+        self.update_time()
+        
+        self.show()
+        self.move(MONITOR_X, MONITOR_Y)
+        self.resize(MONITOR_W, MONITOR_H)
+        self.raise_()
+        self.activateWindow()
+    
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+    
+    def update_time(self):
+        now = datetime.now()
+        self.time_label.setText(now.strftime("%H:%M:%S"))
+        self.date_label.setText(now.strftime("%d.%m.%Y"))
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle("Fusion")
+    
+    palette = QPalette()
+    palette.setColor(QPalette.ColorRole.Window, QColor(10, 10, 42))
+    app.setPalette(palette)
+    
+    window = DisplayWindow()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
+'''
+    
+    def _generate_tkinter_script(self, monitor_index: int) -> str:
+        """Generate Tkinter display script"""
+        return f'''# -*- coding: utf-8 -*-
+import sys, os, tkinter as tk
+from datetime import datetime
+
+MONITOR_INDEX = int(os.environ.get('MONITOR_INDEX', {monitor_index}))
+MONITOR_X = int(os.environ.get('MONITOR_X', 0))
+MONITOR_Y = int(os.environ.get('MONITOR_Y', 0))
+MONITOR_W = int(os.environ.get('MONITOR_WIDTH', 1920))
+MONITOR_H = int(os.environ.get('MONITOR_HEIGHT', 1080))
+
+root = tk.Tk()
+root.title(f"Monitor {{MONITOR_INDEX}}")
+root.overrideredirect(True)
+root.geometry(f"{{MONITOR_W}}x{{MONITOR_H}}+{{MONITOR_X}}+{{MONITOR_Y}}")
+root.configure(bg='#0a0a2a')
+root.attributes('-topmost', True)
+
+# Monitor info
+tk.Label(root, text=f"🖥️ Monitor {{MONITOR_INDEX}}", 
+         font=('Arial', 48, 'bold'), 
+         fg='#00FF00', bg='#0a0a2a').pack(expand=True)
+
+tk.Label(root, text=f"{{MONITOR_W}}×{{MONITOR_H}}", 
+         font=('Arial', 24), 
+         fg='#FFD700', bg='#0a0a2a').pack(expand=True)
+
+# Time display
+time_label = tk.Label(root, text="", font=('Arial', 60, 'bold'), 
+                      fg='#00BFFF', bg='#0a0a2a')
+time_label.pack(expand=True)
+
+date_label = tk.Label(root, text="", font=('Arial', 18), 
+                      fg='#95A5A6', bg='#0a0a2a')
+date_label.pack(expand=True)
+
+def update_time():
+    now = datetime.now()
+    time_label.config(text=now.strftime("%H:%M:%S"))
+    date_label.config(text=now.strftime("%d.%m.%Y"))
+    root.after(1000, update_time)
+
+update_time()
+root.bind('<Escape>', lambda e: root.destroy())
+root.mainloop()
+'''
+    
+    def get_monitor_info(self, index: Optional[int] = None) -> Optional[Union[MonitorInfo, List[MonitorInfo]]]:
+        """
+        Get monitor information
+        
+        Args:
+            index: Monitor index (optional)
+            
+        Returns:
+            MonitorInfo object, list of all monitors, or None if index is invalid
+        """
+        if index is not None:
+            return self.monitors[index] if 0 <= index < len(self.monitors) else None
+        return self.monitors.copy()
+    
+    def get_primary_monitor(self) -> Optional[MonitorInfo]:
+        """Get the primary monitor"""
+        for monitor in self.monitors:
+            if monitor.is_primary:
+                return monitor
+        return self.monitors[0] if self.monitors else None
+    
+    def get_monitor_at_position(self, x: int, y: int) -> Optional[MonitorInfo]:
+        """Get monitor at specific screen coordinates"""
+        for monitor in self.monitors:
+            if (monitor.x <= x < monitor.x + monitor.width and 
+                monitor.y <= y < monitor.y + monitor.height):
+                return monitor
+        return None
+    
+    def get_total_resolution(self) -> tuple:
+        """Get total desktop resolution"""
+        if not self.monitors:
+            return (0, 0)
+        
+        min_x = min(m.x for m in self.monitors)
+        max_x = max(m.x + m.width for m in self.monitors)
+        min_y = min(m.y for m in self.monitors)
+        max_y = max(m.y + m.height for m in self.monitors)
+        
+        return (max_x - min_x, max_y - min_y)
+    
+    def show_status(self):
+        """Display current status of all monitors"""
+        print("\n" + "="*60)
+        print("MULTI-MONITOR MANAGER STATUS")
+        print("="*60)
+        
+        for i, mon in enumerate(self.monitors):
+            status = "Active" if i in self.processes and self.processes[i].poll() is None else "Inactive"
+            print(f"\n{i+1}. {mon.name} {'(PRIMARY)' if mon.is_primary else ''}")
+            print(f"   Resolution: {mon.width}×{mon.height}")
+            print(f"   Position: ({mon.x}, {mon.y})")
+            print(f"   Status: {status}")
+        
+        print("="*60 + "\n")
+    
+    def refresh(self):
+        """Refresh monitor detection and restart processes"""
+        self.stop()
+        self._detect_monitors_accurate()
+    
+    def stop(self):
+        """Stop all launched processes"""
+        self.is_running = False
+        for p in list(self.processes.values()):
+            try:
+                if p.poll() is None:
+                    p.terminate()
+                    p.wait(timeout=3)
+            except:
+                try:
+                    p.kill()
+                except:
+                    pass
+        self.processes.clear()
+        logger.info("All processes stopped")
+    
+    def __del__(self):
+        self.stop()
+
+
+# Convenience function
+def get_monitor_manager(config_dir: Optional[str] = None) -> MultiMonitorManager:
+    """Get or create the global monitor manager instance"""
+    return MultiMonitorManager(config_dir)
+
+
+# Example usage
+if __name__ == "__main__":
+    # Configure logging
+    logging.basicConfig(level=logging.INFO)
+    
+    # Create manager
+    manager = MultiMonitorManager()
+    
+    # Display all monitors
+    manager.show_status()
+    
+    # Launch display windows on all non-primary monitors
+    for i, mon in enumerate(manager.get_monitor_info()):
+        if not mon.is_primary:
+            print(f"Launching display on monitor {i}...")
+            manager.launch_display_window(i)
+    
+    # Keep running
+    try:
+        import time
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopping...")
+        manager.stop()
