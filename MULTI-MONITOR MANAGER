@@ -413,8 +413,8 @@ class MultiMonitorManager:
         if monitor_index in self.processes:
             try:
                 self.processes[monitor_index].kill()
-            except:
-                pass
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.warning("Could not stop previous process for monitor %s: %s", monitor_index, exc)
             del self.processes[monitor_index]
         
         monitor = self.monitors[monitor_index]
